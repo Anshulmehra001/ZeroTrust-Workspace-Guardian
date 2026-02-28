@@ -14,7 +14,7 @@ class ZeroTrustGuardian:
         # Initialize database
         self.init_database()
         
-        # Load face detector
+        # Load face detector (single, most reliable one)
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
@@ -36,6 +36,11 @@ class ZeroTrustGuardian:
         self.last_threat_type = None
         self.consecutive_threats = 0
         self.THREAT_CONFIRMATION_THRESHOLD = config.SHOULDER_SURFING['confirmation_threshold']
+        
+        # Additional tracking for stability
+        self.last_known_face_count = 1  # Assume user starts alone
+        self.face_lost_time = None
+        self.FACE_LOST_GRACE_PERIOD = 2.0  # seconds before considering face truly lost
         
         # Test mode
         self.test_mode = config.ADVANCED['test_mode']
@@ -84,6 +89,49 @@ class ZeroTrustGuardian:
         filename = f'threat_logs/{threat_type}_{timestamp}.jpg'
         cv2.imwrite(filename, frame)
         return filename
+    
+    def remove_overlapping_faces(self, faces):
+        """Remove duplicate/overlapping face detections using non-maximum suppression"""
+        if len(faces) == 0:
+            return []
+        
+        # Convert to numpy array
+        boxes = np.array(faces)
+        
+        # Calculate areas
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 0] + boxes[:, 2]
+        y2 = boxes[:, 1] + boxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)
+        
+        # Sort by area (larger boxes first)
+        order = areas.argsort()[::-1]
+        
+        keep = []
+        while len(order) > 0:
+            i = order[0]
+            keep.append(i)
+            
+            if len(order) == 1:
+                break
+            
+            # Calculate IoU with remaining boxes
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            
+            intersection = w * h
+            iou = intersection / (areas[i] + areas[order[1:]] - intersection + 1e-5)
+            
+            # Keep only boxes with IoU < 0.5 (not overlapping much)
+            order = order[1:][iou < 0.5]
+        
+        return [tuple(boxes[i]) for i in keep]
     
     def detect_phone_camera(self, frame):
         """Detect rectangular objects that might be phones/cameras - improved accuracy"""
@@ -160,14 +208,23 @@ class ZeroTrustGuardian:
             # Convert to grayscale for face detection
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-            # Detect faces with configured parameters
+            # Enhance image quality for better detection
+            gray = cv2.equalizeHist(gray)  # Improve contrast
+            
+            # Primary face detection (most reliable)
             faces = self.face_cascade.detectMultiScale(
                 gray, 
-                scaleFactor=config.FACE_DETECTION['scaleFactor'],
-                minNeighbors=config.FACE_DETECTION['minNeighbors'],
-                minSize=config.FACE_DETECTION['minSize'],
-                maxSize=config.FACE_DETECTION['maxSize']
+                scaleFactor=1.1,
+                minNeighbors=6,  # Higher = fewer false positives
+                minSize=(80, 80),  # Larger minimum to avoid small false detections
+                maxSize=(400, 400),
+                flags=cv2.CASCADE_SCALE_IMAGE
             )
+            
+            # Remove overlapping detections (non-maximum suppression)
+            if len(faces) > 0:
+                faces = self.remove_overlapping_faces(list(faces))
+            
             face_count = len(faces)
             
             # Add to history for stabilization
@@ -245,8 +302,10 @@ class ZeroTrustGuardian:
                 self.last_threat_type = None
             
             # SAFE: Exactly 1 face with good consistency
-            if stable_face_count == 1 and face_consistency > 0.7:
+            if stable_face_count == 1 and face_consistency > config.STABILIZATION['consistency_threshold']:
                 self.user_absent_time = None  # Reset absence timer
+                self.face_lost_time = None  # Reset face lost timer
+                self.last_known_face_count = 1
                 
                 # Reset threat counters when safe
                 if self.last_threat_type in ["shoulder_surfing", "camera"]:
@@ -260,36 +319,100 @@ class ZeroTrustGuardian:
                     self.last_threat_type = None
                     self.consecutive_threats = 0
             
+            # Handle temporary face loss (movement, rotation)
+            elif stable_face_count == 0:
+                if self.last_known_face_count == 1:
+                    # Face was just detected, might be temporary loss
+                    if self.face_lost_time is None:
+                        self.face_lost_time = current_time
+                        print("⚠️  Face temporarily lost - grace period active...")
+                    
+                    time_lost = current_time - self.face_lost_time
+                    
+                    # Within grace period - don't trigger absence
+                    if time_lost < self.FACE_LOST_GRACE_PERIOD:
+                        cv2.putText(frame, f"Face Lost: {time_lost:.1f}s / {self.FACE_LOST_GRACE_PERIOD}s grace", 
+                                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                        # Don't start absence timer yet
+                        continue_to_absence = False
+                    else:
+                        # Grace period expired, now consider truly absent
+                        continue_to_absence = True
+                else:
+                    continue_to_absence = True
+                
+                if continue_to_absence and config.USER_ABSENCE['enabled'] and face_consistency > config.STABILIZATION['consistency_threshold']:
+                    if self.user_absent_time is None:
+                        self.user_absent_time = current_time
+                        print("⚠️  User absence detected - monitoring...")
+                    
+                    absent_duration = int(current_time - self.user_absent_time)
+                    
+                    if absent_duration > self.ABSENCE_THRESHOLD:
+                        if not self.privacy_mode:
+                            print(f"🚨 USER ABSENT FOR {absent_duration}s - AUTO LOCKING")
+                            self.log_threat("User Absence", 0, "Screen Locked (Simulated)", None)
+                            self.blur_screen()
+                            self.privacy_mode = True
+                            self.last_action_time = current_time
+                    
+                    # Visual warning
+                    warning_color = (0, 165, 255) if absent_duration < self.ABSENCE_THRESHOLD else (0, 0, 255)
+                    cv2.putText(frame, f"User Absent: {absent_duration}s / {self.ABSENCE_THRESHOLD}s", 
+                               (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, warning_color, 2)
+                    
+                    # Progress bar
+                    progress = min(absent_duration / self.ABSENCE_THRESHOLD, 1.0)
+                    bar_width = int(300 * progress)
+                    cv2.rectangle(frame, (10, 130), (310, 145), (100, 100, 100), -1)
+                    cv2.rectangle(frame, (10, 130), (10 + bar_width, 145), warning_color, -1)
+            else:
+                # Multiple faces or other count
+                self.face_lost_time = None
+                if stable_face_count > 0:
+                    self.last_known_face_count = stable_face_count
+                    self.user_absent_time = None
+                    self.last_action_time = current_time
+                    self.last_threat_type = None
+                    self.consecutive_threats = 0
+            
             # THREAT 3: User absence - with grace period
             if config.USER_ABSENCE['enabled'] and stable_face_count == 0 and face_consistency > config.STABILIZATION['consistency_threshold']:
-                if self.user_absent_time is None:
-                    self.user_absent_time = current_time
-                    print("⚠️  User absence detected - monitoring...")
-                
-                absent_duration = int(current_time - self.user_absent_time)
-                
-                if absent_duration > self.ABSENCE_THRESHOLD:
-                    if not self.privacy_mode:
-                        print(f"🚨 USER ABSENT FOR {absent_duration}s - AUTO LOCKING")
-                        self.log_threat("User Absence", 0, "Screen Locked (Simulated)", None)
-                        # Uncomment to actually lock:
-                        # self.lock_screen()
-                        self.blur_screen()  # For demo, just minimize
-                        self.privacy_mode = True
-                        self.last_action_time = current_time
-                
-                # Visual warning
-                warning_color = (0, 165, 255) if absent_duration < self.ABSENCE_THRESHOLD else (0, 0, 255)
-                cv2.putText(frame, f"User Absent: {absent_duration}s / {self.ABSENCE_THRESHOLD}s", 
-                           (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, warning_color, 2)
-                
-                # Progress bar
-                progress = min(absent_duration / self.ABSENCE_THRESHOLD, 1.0)
-                bar_width = int(300 * progress)
-                cv2.rectangle(frame, (10, 130), (310, 145), (100, 100, 100), -1)
-                cv2.rectangle(frame, (10, 130), (10 + bar_width, 145), warning_color, -1)
+                if continue_to_absence:
+                    # THREAT 3: User absence - with grace period
+                    if config.USER_ABSENCE['enabled'] and face_consistency > config.STABILIZATION['consistency_threshold']:
+                        if self.user_absent_time is None:
+                            self.user_absent_time = current_time
+                            print("⚠️  User absence detected - monitoring...")
+                        
+                        absent_duration = int(current_time - self.user_absent_time)
+                        
+                        if absent_duration > self.ABSENCE_THRESHOLD:
+                            if not self.privacy_mode:
+                                print(f"🚨 USER ABSENT FOR {absent_duration}s - AUTO LOCKING")
+                                self.log_threat("User Absence", 0, "Screen Locked (Simulated)", None)
+                                # Uncomment to actually lock:
+                                # self.lock_screen()
+                                self.blur_screen()  # For demo, just minimize
+                                self.privacy_mode = True
+                                self.last_action_time = current_time
+                        
+                        # Visual warning
+                        warning_color = (0, 165, 255) if absent_duration < self.ABSENCE_THRESHOLD else (0, 0, 255)
+                        cv2.putText(frame, f"User Absent: {absent_duration}s / {self.ABSENCE_THRESHOLD}s", 
+                                   (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, warning_color, 2)
+                        
+                        # Progress bar
+                        progress = min(absent_duration / self.ABSENCE_THRESHOLD, 1.0)
+                        bar_width = int(300 * progress)
+                        cv2.rectangle(frame, (10, 130), (310, 145), (100, 100, 100), -1)
+                        cv2.rectangle(frame, (10, 130), (10 + bar_width, 145), warning_color, -1)
             else:
-                self.user_absent_time = None
+                # Multiple faces or other count
+                self.face_lost_time = None
+                if stable_face_count > 0:
+                    self.last_known_face_count = stable_face_count
+                    self.user_absent_time = None
             
             # Display status with confidence
             status_color = (0, 255, 0) if stable_face_count == 1 else (0, 0, 255)

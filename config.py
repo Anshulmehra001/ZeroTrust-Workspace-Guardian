@@ -9,15 +9,15 @@ Adjust these settings for optimal accuracy in your environment
 
 # Face detection parameters (adjust for your lighting/camera)
 FACE_DETECTION = {
-    'scaleFactor': 1.15,      # 1.1-1.3: Lower = more sensitive but slower
-    'minNeighbors': 5,        # 3-8: Higher = fewer false positives
-    'minSize': (60, 60),      # Minimum face size in pixels
+    'scaleFactor': 1.1,       # 1.1-1.3: Lower = more sensitive but slower
+    'minNeighbors': 6,        # 3-8: Higher = fewer false positives
+    'minSize': (80, 80),      # Minimum face size in pixels
     'maxSize': (400, 400),    # Maximum face size in pixels
 }
 
 # Stabilization settings
 STABILIZATION = {
-    'face_history_length': 20,    # Number of frames to track (higher = more stable)
+    'face_history_length': 30,    # Number of frames to track (higher = more stable)
     'phone_history_length': 10,   # Frames for phone detection
     'consistency_threshold': 0.6,  # 0.0-1.0: Minimum consistency to trigger action
 }
@@ -29,7 +29,7 @@ STABILIZATION = {
 # Shoulder surfing (multiple faces)
 SHOULDER_SURFING = {
     'enabled': True,
-    'confirmation_threshold': 3,   # Consecutive detections needed
+    'confirmation_threshold': 4,   # Consecutive detections needed
     'cooldown_seconds': 3.0,       # Time between actions
     'action': 'minimize',          # 'minimize', 'blur', or 'lock'
 }
