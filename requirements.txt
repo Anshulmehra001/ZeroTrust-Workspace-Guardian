@@ -1,0 +1,7 @@
+opencv-python
+pyautogui==0.9.54
+numpy
+pillow
+tkinter
+pillow
+tkinter
