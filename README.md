@@ -150,4 +150,4 @@ PERFORMANCE = {'camera_index': 1}  # Try 0, 1, or 2
 
 ---
 
-**Built for AMD Slingshot Hackathon 2024** | Edge AI + Privacy First
+**Built for AMD Slingshot Hackathon* | Edge AI + Privacy First
